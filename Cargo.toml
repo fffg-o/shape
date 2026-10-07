@@ -1,0 +1,12 @@
+
+[workspace]
+resolver = "2"
+members = [
+    "src/crates/capture",
+    "src/crates/encoder",
+    "src/crates/renderer",
+    "src/apps/client",
+    "src/crates/protocol",
+    "src/crates/transport",
+    "src/crates/decoder"
+]

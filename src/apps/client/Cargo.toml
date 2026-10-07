@@ -1,0 +1,16 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+capture = {path="../../crates/capture"}
+renderer = {path="../../crates/renderer"}
+encoder = {path = "../../crates/encoder"}
+protocol = {path = "../../crates/protocol"}
+decoder = { path = "../../crates/decoder" }
+winit = "0.30.13"
+pollster = "1.0.1"
+wgpu="29.0.0"
+image = "0.25.10"
+windows = "0.62"
