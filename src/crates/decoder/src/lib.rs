@@ -50,7 +50,8 @@ use windows::{
         System::Com::CoTaskMemFree,
     },
 };
-use windows::Win32::Media::MediaFoundation::MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES;
+use windows::core::Error;
+use windows::Win32::Media::MediaFoundation::{MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MF_E_INVALIDMEDIATYPE, MF_E_NO_MORE_TYPES, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_DEFAULT_STRIDE};
 
 pub struct DecodedFrame {
     pub data: Vec<u8>,
@@ -65,6 +66,9 @@ pub struct Decoder {
     events: Option<IMFMediaEventGenerator>,
     width: u32,
     height: u32,
+    surface_width: u32,
+    surface_height: u32,
+    stride: usize,
     fps: u32,
     started: bool,
     async_mode: bool,
@@ -138,6 +142,9 @@ impl Decoder {
                     events,
                     width,
                     height,
+                    surface_width: width,
+                    surface_height: height,
+                    stride: width as usize,
                     fps,
                     started: true,
                     async_mode,
@@ -376,8 +383,71 @@ impl Decoder {
         }
 
         Ok(())
-    }
+    }unsafe fn renegotiate_output_type(&mut self) -> Result<()> {
+        let mut index = 0;
 
+        loop {
+            let media_type =
+                match self.transform.GetOutputAvailableType(0, index) {
+                    Ok(media_type) => media_type,
+                    Err(error) => {
+                        if error.code() == MF_E_NO_MORE_TYPES {
+                            break;
+                        }
+
+                        return Err(error);
+                    }
+                };
+
+            let subtype =
+                media_type.GetGUID(&MF_MT_SUBTYPE)?;
+
+            if subtype == MFVideoFormat_NV12 {
+                self.transform.SetOutputType(
+                    0,
+                    &media_type,
+                    0,
+                )?;
+
+                let frame_size =
+                    media_type.GetUINT64(
+                        &MF_MT_FRAME_SIZE,
+                    )?;
+
+                self.surface_width =
+                    (frame_size >> 32) as u32;
+
+                self.surface_height =
+                    frame_size as u32;
+
+                self.stride =
+                    match media_type.GetUINT32(
+                        &MF_MT_DEFAULT_STRIDE,
+                    ) {
+                        Ok(value) => {
+                            let value = value as i32;
+                            if value == 0 {
+                                self.surface_width as usize
+                            } else {
+                                value.unsigned_abs() as usize
+                            }
+                        }
+                        Err(_) => {
+                            self.surface_width as usize
+                        }
+                    };
+
+                return Ok(());
+            }
+
+            index += 1;
+        }
+
+        Err(Error::new(
+            MF_E_INVALIDMEDIATYPE,
+            "decoder did not expose an NV12 output type",
+        ))
+    }
     pub fn create_sample(
         &self,
         data: &[u8],
@@ -477,152 +547,158 @@ impl Decoder {
                 self.pending_outputs -= 1;
             }
 
-            let stream_info =
-                self.transform
-                    .GetOutputStreamInfo(0)?;
+            loop {
+                let stream_info =
+                    self.transform
+                        .GetOutputStreamInfo(0)?;
 
-            let mut output =
-                MFT_OUTPUT_DATA_BUFFER::default();
+                let mut output =
+                    MFT_OUTPUT_DATA_BUFFER::default();
 
-            output.dwStreamID = 0;
+                output.dwStreamID = 0;
 
-            if stream_info.dwFlags
-                & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32
-                | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0 as u32)
-                == 0
-            {
-                let buffer =
-                    MFCreateMemoryBuffer(
-                        stream_info.cbSize.max(
-                            self.width
-                                * self.height
-                                * 3
-                                / 2,
-                        ),
+                if stream_info.dwFlags
+                    & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32
+                    | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0 as u32)
+                    == 0
+                {
+                    let surface_size =
+                    (self.stride
+                        * self.surface_height as usize
+                        * 3
+                        / 2) as u32;
+
+                    let buffer =
+                        MFCreateMemoryBuffer(
+                            stream_info.cbSize.max(
+                                surface_size,
+                            ),
+                        )?;
+
+                    let sample =
+                        MFCreateSample()?;
+
+                    sample.AddBuffer(
+                        &buffer,
                     )?;
 
-                let sample =
-                    MFCreateSample()?;
-
-                sample.AddBuffer(
-                    &buffer,
-                )?;
-
-                output.pSample =
-                    ManuallyDrop::new(
-                        Some(sample),
-                    );
-            }
-
-            let mut status =
-                0u32;
-
-            match self.transform.ProcessOutput(
-                0,
-                std::slice::from_mut(
-                    &mut output,
-                ),
-                &mut status,
-            ) {
-                Ok(()) => {}
-                Err(error) => {
-                    let _events =
-                        ManuallyDrop::take(
-                            &mut output.pEvents,
+                    output.pSample =
+                        ManuallyDrop::new(
+                            Some(sample),
                         );
+                }
 
-                    if !output.pSample.is_none() {
+                let mut status = 0u32;
+
+                match self.transform.ProcessOutput(
+                    0,
+                    std::slice::from_mut(
+                        &mut output,
+                    ),
+                    &mut status,
+                ) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        let _events =
+                            ManuallyDrop::take(
+                                &mut output.pEvents,
+                            );
+
                         let _sample =
                             ManuallyDrop::take(
                                 &mut output.pSample,
                             );
-                    }
 
-                    if error.code()
-                        == MF_E_TRANSFORM_NEED_MORE_INPUT
-                    {
-                        return Ok(None);
-                    }
+                        if error.code()
+                            == MF_E_TRANSFORM_STREAM_CHANGE
+                        {
+                            self.renegotiate_output_type()?;
+                            continue;
+                        }
 
-                    return Err(error);
+                        if error.code()
+                            == MF_E_TRANSFORM_NEED_MORE_INPUT
+                        {
+                            return Ok(None);
+                        }
+
+                        return Err(error);
+                    }
                 }
-            }
 
-            let sample =
-                ManuallyDrop::take(
-                    &mut output.pSample,
-                );
-
-            let _events =
-                ManuallyDrop::take(
-                    &mut output.pEvents,
-                );
-
-            let sample =
-                match sample {
-                    Some(sample) => sample,
-                    None => return Ok(None),
-                };
-
-            let timestamp =
-                sample
-                    .GetSampleTime()
-                    .unwrap_or(0);
-
-            let duration =
-                sample
-                    .GetSampleDuration()
-                    .unwrap_or(
-                        10_000_000i64
-                            / self.fps
-                            as i64,
+                let sample =
+                    ManuallyDrop::take(
+                        &mut output.pSample,
                     );
 
-            let buffer =
-                sample
-                    .ConvertToContiguousBuffer()?;
+                let _events =
+                    ManuallyDrop::take(
+                        &mut output.pEvents,
+                    );
 
-            let length =
-                buffer.GetCurrentLength()?
-                    as usize;
+                let sample =
+                    match sample {
+                        Some(sample) => sample,
+                        None => return Ok(None),
+                    };
 
-            if length == 0 {
-                return Ok(None);
+                let timestamp =
+                    sample
+                        .GetSampleTime()
+                        .unwrap_or(0);
+
+                let duration =
+                    sample
+                        .GetSampleDuration()
+                        .unwrap_or(
+                            10_000_000i64
+                                / self.fps
+                                as i64,
+                        );
+
+                let buffer =
+                    sample
+                        .ConvertToContiguousBuffer()?;
+
+                let length =
+                    buffer.GetCurrentLength()?
+                        as usize;
+
+                if length == 0 {
+                    return Ok(None);
+                }
+
+                let mut data_ptr =
+                    std::ptr::null_mut();
+
+                let mut max_length = 0u32;
+                let mut current_length = 0u32;
+
+                buffer.Lock(
+                    &mut data_ptr,
+                    Some(&mut max_length),
+                    Some(&mut current_length),
+                )?;
+
+                let data =
+                    std::slice::from_raw_parts(
+                        data_ptr,
+                        length,
+                    )
+                        .to_vec();
+
+                buffer.Unlock()?;
+
+                return Ok(Some(
+                    DecodedFrame {
+                        data,
+                        width: self.width,
+                        height: self.height,
+                        timestamp,
+                        duration,
+                    },
+                ));
             }
-
-            let mut data_ptr =
-                std::ptr::null_mut();
-
-            let mut max_length =
-                0u32;
-
-            let mut current_length =
-                0u32;
-
-            buffer.Lock(
-                &mut data_ptr,
-                Some(&mut max_length),
-                Some(&mut current_length),
-            )?;
-
-            let data =
-                std::slice::from_raw_parts(
-                    data_ptr,
-                    length,
-                )
-                    .to_vec();
-
-            buffer.Unlock()?;
-
-            Ok(Some(
-                DecodedFrame {
-                    data,
-                    width: self.width,
-                    height: self.height,
-                    timestamp,
-                    duration,
-                },
-            ))
         }
     }
 
@@ -645,7 +721,6 @@ impl Decoder {
 
         self.drain_outputs()
     }
-
     pub fn nv12_to_bgra(
         &self,
         nv12: &[u8],
@@ -656,12 +731,18 @@ impl Decoder {
         let height =
             self.height as usize;
 
+        let surface_height =
+            self.surface_height as usize;
+
+        let stride =
+            self.stride;
+
         let y_size =
-            width * height;
+            stride * surface_height;
 
         let required =
             y_size
-                + width * height / 2;
+                + stride * surface_height / 2;
 
         assert!(
             nv12.len() >= required
@@ -685,11 +766,11 @@ impl Decoder {
             for x in 0..width {
                 let y_value =
                     y_plane[
-                        y * width + x
+                        y * stride + x
                         ] as i32;
 
                 let uv_index =
-                    (y / 2) * width
+                    (y / 2) * stride
                         + (x / 2) * 2;
 
                 let u =

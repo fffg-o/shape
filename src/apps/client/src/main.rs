@@ -199,13 +199,7 @@ impl ApplicationHandler for App {
                             capture
                                 .read_texture(&frame)
                                 .unwrap();
-
-                        renderer.update_frame(
-                            frame.width,
-                            frame.height,
-                            &data,
-                        );
-
+                        
                         self.frame_count += 1;
 
                         if let Some(encoder) =
