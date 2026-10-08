@@ -9,4 +9,4 @@ members = [
     "src/crates/protocol",
     "src/crates/transport",
     "src/crates/decoder"
-]
+, "src/apps/host"]

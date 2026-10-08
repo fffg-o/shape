@@ -1,15 +1,15 @@
 [package]
-name = "client"
+name = "host"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-renderer = { path = "../../crates/renderer" }
+capture = { path = "../../crates/capture" }
+encoder = { path = "../../crates/encoder" }
 protocol = { path = "../../crates/protocol" }
-decoder = { path = "../../crates/decoder" }
 transport = { path = "../../crates/transport" }
-winit = "0.30.13"
-pollster = "1.0.1"
 tokio = { version = "1", features = [
+    "macros",
     "rt-multi-thread",
+    "time",
 ] }
