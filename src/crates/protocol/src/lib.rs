@@ -1,4 +1,5 @@
-use std::{collections::HashMap, fmt};
+use std::{collections::HashMap, fmt,
+          time::{Duration, Instant},};
 
 pub const MAGIC: [u8; 4] = *b"RDP1";
 pub const VERSION: u8 = 1;
@@ -9,6 +10,8 @@ pub const FRAGMENT_HEADER_SIZE: usize = 40;
 pub const MAX_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
 pub const MAX_FRAME_FRAGMENTS: usize = u16::MAX as usize;
 pub const MAX_ASSEMBLY_FRAMES: usize = 8;
+const MAX_ASSEMBLY_BYTES: usize = MAX_PAYLOAD_SIZE;
+const ASSEMBLY_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoPacket {
@@ -558,6 +561,7 @@ impl VideoFragment {
     }
 }
 
+
 struct PartialFrame {
     timestamp: i64,
     duration: i64,
@@ -565,10 +569,13 @@ struct PartialFrame {
     fragment_count: u16,
     fragments: Vec<Option<Vec<u8>>>,
     received: usize,
+    created_at: Instant,
+    payload_len: usize,
 }
 
 pub struct FrameAssembler {
     frames: HashMap<u64, PartialFrame>,
+    buffered_bytes: usize,
 }
 
 impl Default for FrameAssembler {
@@ -581,6 +588,32 @@ impl FrameAssembler {
     pub fn new() -> Self {
         Self {
             frames: HashMap::new(),
+            buffered_bytes: 0,
+        }
+    }
+
+    fn remove_frame(&mut self, sequence: u64) -> Option<PartialFrame> {
+        let frame = self.frames.remove(&sequence)?;
+        self.buffered_bytes = self
+            .buffered_bytes
+            .saturating_sub(frame.payload_len);
+        Some(frame)
+    }
+
+    fn remove_expired_frames(&mut self) {
+        let now = Instant::now();
+
+        let expired: Vec<u64> = self
+            .frames
+            .iter()
+            .filter(|(_, frame)| {
+                now.duration_since(frame.created_at) >= ASSEMBLY_TIMEOUT
+            })
+            .map(|(sequence, _)| *sequence)
+            .collect();
+
+        for sequence in expired {
+            self.remove_frame(sequence);
         }
     }
 
@@ -589,146 +622,143 @@ impl FrameAssembler {
         fragment: VideoFragment,
     ) -> Result<Option<VideoPacket>, ProtocolError> {
         if fragment.fragment_count == 0 {
-            return Err(
-                ProtocolError::InvalidFragmentCount
-            );
+            return Err(ProtocolError::InvalidFragmentCount);
         }
 
-        if fragment.fragment_index
-            >= fragment.fragment_count
-        {
-            return Err(
-                ProtocolError::InvalidFragmentIndex
-            );
+        if fragment.fragment_index >= fragment.fragment_count {
+            return Err(ProtocolError::InvalidFragmentIndex);
         }
 
-        if !self.frames.contains_key(
-            &fragment.sequence
-        ) {
-            if self.frames.len()
-                >= MAX_ASSEMBLY_FRAMES
-            {
-                if let Some(oldest) =
-                    self.frames.keys().min().copied()
-                {
-                    self.frames.remove(
-                        &oldest
-                    );
+        let sequence = fragment.sequence;
+        let timestamp = fragment.timestamp;
+        let duration = fragment.duration;
+        let keyframe = fragment.keyframe;
+        let fragment_count = fragment.fragment_count;
+        let fragment_index = fragment.fragment_index as usize;
+
+        self.remove_expired_frames();
+
+        if fragment.payload.len() > MAX_PAYLOAD_SIZE {
+            return Err(ProtocolError::PayloadTooLarge);
+        }
+
+        if !self.frames.contains_key(&sequence) {
+            if self.frames.len() >= MAX_ASSEMBLY_FRAMES {
+                let oldest = self
+                    .frames
+                    .iter()
+                    .min_by_key(|(_, frame)| frame.created_at)
+                    .map(|(sequence, _)| *sequence);
+
+                if let Some(oldest) = oldest {
+                    self.remove_frame(oldest);
                 }
             }
 
             self.frames.insert(
-                fragment.sequence,
+                sequence,
                 PartialFrame {
-                    timestamp:
-                    fragment.timestamp,
-                    duration:
-                    fragment.duration,
-                    keyframe:
-                    fragment.keyframe,
-                    fragment_count:
-                    fragment.fragment_count,
-                    fragments:
-                    vec![
-                        None;
-                        fragment
-                            .fragment_count
-                            as usize
-                    ],
+                    timestamp,
+                    duration,
+                    keyframe,
+                    fragment_count,
+                    fragments: vec![None; fragment_count as usize],
                     received: 0,
+                    created_at: Instant::now(),
+                    payload_len: 0,
                 },
             );
         }
 
-        let frame =
-            self.frames.get_mut(
-                &fragment.sequence
-            ).unwrap();
+        let metadata_mismatch = {
+            let frame = self.frames.get(&sequence).unwrap();
 
-        if frame.fragment_count
-            != fragment.fragment_count
-            || frame.timestamp
-            != fragment.timestamp
-            || frame.duration
-            != fragment.duration
-            || frame.keyframe
-            != fragment.keyframe
-        {
-            self.frames.remove(
-                &fragment.sequence
-            );
+            frame.fragment_count != fragment_count
+                || frame.timestamp != timestamp
+                || frame.duration != duration
+                || frame.keyframe != keyframe
+        };
 
+        if metadata_mismatch {
+            self.remove_frame(sequence);
             return Ok(None);
         }
 
-        let slot =
-            &mut frame.fragments[
-                fragment.fragment_index
-                    as usize
-                ];
+        let already_received = self.frames
+            .get(&sequence)
+            .unwrap()
+            .fragments[fragment_index]
+            .is_some();
 
-        if slot.is_none() {
-            *slot =
-                Some(fragment.payload);
+        if !already_received {
+            let added_len = fragment.payload.len();
 
-            frame.received += 1;
-        }
+            let current_len = self
+                .frames
+                .get(&sequence)
+                .unwrap()
+                .payload_len;
 
-        if frame.received
-            != frame.fragment_count as usize
-        {
-            return Ok(None);
-        }
+            if current_len.saturating_add(added_len) > MAX_PAYLOAD_SIZE {
+                self.remove_frame(sequence);
+                return Err(ProtocolError::PayloadTooLarge);
+            }
 
-        let frame =
-            self.frames
-                .remove(
-                    &fragment.sequence
-                )
-                .unwrap();
-
-        let total_len =
-            frame.fragments
-                .iter()
-                .filter_map(
-                    |fragment| {
-                        fragment
-                            .as_ref()
-                            .map(Vec::len)
-                    }
-                )
-                .sum();
-
-        let mut payload =
-            Vec::with_capacity(
-                total_len
-            );
-
-        for fragment in
-            frame.fragments
-        {
-            if let Some(fragment) =
-                fragment
+            while self.buffered_bytes.saturating_add(added_len)
+                > MAX_ASSEMBLY_BYTES
             {
-                payload.extend_from_slice(
-                    &fragment
-                );
+                let oldest = self
+                    .frames
+                    .iter()
+                    .filter(|(candidate, _)| **candidate != sequence)
+                    .min_by_key(|(_, frame)| frame.created_at)
+                    .map(|(sequence, _)| *sequence);
+
+                match oldest {
+                    Some(oldest) => {
+                        self.remove_frame(oldest);
+                    }
+                    None => {
+                        self.remove_frame(sequence);
+                        return Err(ProtocolError::PayloadTooLarge);
+                    }
+                }
+            }
+
+            let frame = self.frames.get_mut(&sequence).unwrap();
+
+            frame.fragments[fragment_index] = Some(fragment.payload);
+            frame.received += 1;
+            frame.payload_len += added_len;
+
+            self.buffered_bytes += added_len;
+        }
+
+        let complete = {
+            let frame = self.frames.get(&sequence).unwrap();
+            frame.received == frame.fragment_count as usize
+        };
+
+        if !complete {
+            return Ok(None);
+        }
+
+        let frame = self.remove_frame(sequence).unwrap();
+        let mut payload = Vec::with_capacity(frame.payload_len);
+
+        for fragment in frame.fragments {
+            if let Some(fragment) = fragment {
+                payload.extend_from_slice(&fragment);
             }
         }
 
-        Ok(Some(
-            VideoPacket {
-                sequence:
-                fragment.sequence,
-                timestamp:
-                frame.timestamp,
-                duration:
-                frame.duration,
-                keyframe:
-                frame.keyframe,
-                payload,
-            }
-        ))
+        Ok(Some(VideoPacket {
+            sequence,
+            timestamp: frame.timestamp,
+            duration: frame.duration,
+            keyframe: frame.keyframe,
+            payload,
+        }))
     }
 }
 
@@ -823,4 +853,38 @@ mod tests {
             payload
         );
     }
+}
+
+#[test]
+fn incomplete_frames_expire() {
+    use std::time::{Duration, Instant};
+
+    let packet = VideoPacket::new(
+        7,
+        0,
+        1,
+        false,
+        vec![1; 100],
+    )
+        .unwrap();
+
+    let fragments = packet.fragment(60).unwrap();
+    let first = fragments[0].clone();
+    let second = fragments[1].clone();
+
+    let mut assembler = FrameAssembler::new();
+
+    assert!(assembler.push(first).unwrap().is_none());
+    assert_eq!(assembler.frames.get(&7).unwrap().received, 1);
+
+    assembler.frames.get_mut(&7).unwrap().created_at =
+        Instant::now() - ASSEMBLY_TIMEOUT - Duration::from_millis(1);
+
+    assert!(assembler.push(second.clone()).unwrap().is_none());
+
+    let frame = assembler.frames.get(&7).unwrap();
+
+    assert_eq!(frame.received, 1);
+    assert_eq!(frame.payload_len, second.payload.len());
+    assert_eq!(assembler.buffered_bytes, second.payload.len());
 }
