@@ -30,7 +30,7 @@ use windows::{
         System::Com::CoTaskMemFree,
     },
 };
-use windows::Win32::Media::MediaFoundation::{IMFMediaEventGenerator, IMFSample, METransformHaveOutput, METransformNeedInput, MFCreateMemoryBuffer, MFCreateSample, MFSampleExtension_CleanPoint, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MF_EVENT_FLAG_NO_WAIT, MF_EVENT_MFT_INPUT_STREAM_ID, MF_E_NO_EVENTS_AVAILABLE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE};
+use windows::Win32::Media::MediaFoundation::{IMFMediaEventGenerator, IMFSample, METransformHaveOutput, METransformNeedInput, MFCreateMemoryBuffer, MFCreateSample, MFSampleExtension_CleanPoint, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MF_EVENT_FLAG_NO_WAIT, MF_EVENT_MFT_INPUT_STREAM_ID, MF_E_NO_EVENTS_AVAILABLE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE};
 
 #[derive(Debug)]
 pub struct EncodedPacket {
@@ -519,10 +519,11 @@ impl Encoder {
 
             output.dwStreamID = 0;
 
-            if stream_info.dwFlags
-                // & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES
-                == 0
-            {
+            let sample_flags =
+                MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32
+                    | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0 as u32;
+
+            if (stream_info.dwFlags & sample_flags) == 0 {
                 let size =
                     stream_info.cbSize.max(1);
 

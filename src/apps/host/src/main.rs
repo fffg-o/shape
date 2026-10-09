@@ -1,7 +1,8 @@
+
 use capture::Capture;
 use encoder::Encoder;
 use protocol::VideoPacket;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use transport::{send_video_packet, TransportServer};
 
 const SERVER_ADDR: &str = "0.0.0.0:5000";
@@ -9,48 +10,28 @@ const CERTIFICATE_PATH: &str = "host.cert";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let server =
-        TransportServer::bind(SERVER_ADDR.parse()?)?;
+    let server = TransportServer::bind(SERVER_ADDR.parse()?)?;
 
-    std::fs::write(
-        CERTIFICATE_PATH,
-        server.certificate(),
+    std::fs::write(CERTIFICATE_PATH, server.certificate())?;
+
+    println!("Host listening: {}", server.local_addr()?);
+    println!("Certificate written: {}", CERTIFICATE_PATH);
+
+    let mut capture = Capture::new()?;
+    let size = capture.size()?;
+
+    println!("Capture: {}x{}", size.0, size.1);
+
+    let encoder = Encoder::new(
+        size.0 as u32,
+        size.1 as u32,
+        60,
+        8_000_000,
     )?;
-
-    println!(
-        "Host listening: {}",
-        server.local_addr()?
-    );
-
-    println!(
-        "Certificate written: {}",
-        CERTIFICATE_PATH
-    );
-
-    let mut capture =
-        Capture::new()?;
-
-    let size =
-        capture.size()?;
-
-    println!(
-        "Capture: {}x{}",
-        size.0,
-        size.1
-    );
-
-    let encoder =
-        Encoder::new(
-            size.0 as u32,
-            size.1 as u32,
-            60,
-            8_000_000,
-        )?;
 
     println!("Waiting for client");
 
-    let connection =
-        server.accept().await?;
+    let connection = server.accept().await?;
 
     println!(
         "Client connected: {}",
@@ -58,80 +39,91 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     let mut pending_input = 0u32;
+    let mut pending_output = 0u32;
     let mut sequence = 0u64;
 
+    let mut stats_started = Instant::now();
+    let mut sent_frames = 0u64;
+    let mut sent_bytes = 0u64;
+    let mut discarded_frames = 0u64;
+
     loop {
-        let (need_input, have_output) =
-            encoder.poll_events()?;
+        let (need_input, have_output) = encoder.poll_events()?;
 
-        pending_input +=
-            need_input;
+        pending_input = pending_input.saturating_add(need_input);
+        pending_output = pending_output.saturating_add(have_output);
 
-        if let Some((frame, discarded)) =
-            capture.try_latest_frame()?
-        {
-            if discarded > 0 {
-                println!(
-                    "Capture discarded: {}",
-                    discarded
-                );
+        while pending_output > 0 {
+            pending_output -= 1;
+
+            if let Some(packet) = encoder.process_output()? {
+                let payload_size = packet.data.len() as u64;
+
+                let video_packet = VideoPacket::new(
+                    sequence,
+                    packet.timestamp,
+                    packet.duration,
+                    packet.keyframe,
+                    packet.data,
+                )?;
+
+                send_video_packet(&connection, &video_packet)?;
+
+                sent_frames += 1;
+                sent_bytes += payload_size;
+                sequence += 1;
             }
+        }
 
-            let data =
-                capture.read_texture(
-                    &frame
+        if pending_input > 0 {
+            if let Some((frame, discarded)) = capture.try_latest_frame()? {
+                discarded_frames += discarded as u64;
+
+                if frame.width != encoder.width()
+                    || frame.height != encoder.height()
+                {
+                    return Err(
+                        format!(
+                            "Capture resolution changed from {}x{} to {}x{}. Encoder reconfiguration is not implemented.",
+                            encoder.width(),
+                            encoder.height(),
+                            frame.width,
+                            frame.height
+                        )
+                            .into(),
+                    );
+                }
+
+                let data = capture.read_texture(&frame)?;
+
+                let sample = encoder.create_input_sample(
+                    &data,
+                    frame.timestamp,
                 )?;
 
-            if pending_input > 0 {
-                let sample =
-                    encoder.create_input_sample(
-                        &data,
-                        frame.timestamp,
-                    )?;
-
-                encoder.submit(
-                    0,
-                    &sample,
-                )?;
+                encoder.submit(0, &sample)?;
 
                 pending_input -= 1;
             }
         }
 
-        if have_output > 0 {
-            if let Some(packet) =
-                encoder.process_output()?
-            {
-                let video_packet =
-                    VideoPacket::new(
-                        sequence,
-                        packet.timestamp,
-                        packet.duration,
-                        packet.keyframe,
-                        packet.data,
-                    )?;
+        let elapsed = stats_started.elapsed().as_secs_f64();
 
-                let fragment_count =
-                    send_video_packet(
-                        &connection,
-                        &video_packet,
-                    )?;
+        if elapsed >= 1.0 {
+            println!(
+                "Stream: {:.1} FPS, {:.2} MiB/s, {} frames sent, {} capture frames discarded",
+                sent_frames as f64 / elapsed,
+                sent_bytes as f64 / elapsed / (1024.0 * 1024.0),
+                sent_frames,
+                discarded_frames,
+            );
 
-                println!(
-                    "Sent seq={} payload={} fragments={} keyframe={}",
-                    video_packet.sequence,
-                    video_packet.payload.len(),
-                    fragment_count,
-                    video_packet.keyframe
-                );
-
-                sequence += 1;
-            }
+            sent_frames = 0;
+            sent_bytes = 0;
+            discarded_frames = 0;
+            stats_started = Instant::now();
         }
 
-        tokio::time::sleep(
-            Duration::from_millis(1)
-        )
-            .await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
