@@ -2,6 +2,9 @@ use protocol::FrameAssembler;
 use protocol::VideoFragment;
 use protocol::VideoPacket;
 use bytes::Bytes;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 use quinn::{
     ClientConfig,
     Connection,
@@ -23,6 +26,9 @@ use std::{
     net::SocketAddr,
     sync::Arc,
 };
+
+
+const KEYFRAME_REQUEST_MAGIC: [u8; 8] = *b"SHAPEKF1";
 
 pub type TransportResult<T> =
 Result<T, Box<dyn Error + Send + Sync>>;
@@ -173,6 +179,14 @@ impl TransportClient {
             endpoint,
             connection,
         })
+    }
+    pub async fn request_keyframe(&self) -> TransportResult<()> {
+        let mut stream = self.connection.open_uni().await?;
+
+        stream.write_all(&KEYFRAME_REQUEST_MAGIC).await?;
+        stream.finish()?;
+
+        Ok(())
     }
 
     pub async fn recv_video_packet(
@@ -325,6 +339,27 @@ pub fn send_video_packet(
     }
 
     Ok(count)
+}
+pub async fn listen_for_keyframe_requests(
+    connection: Connection,
+    tx: tokio::sync::mpsc::Sender<()>,
+) -> TransportResult<()> {
+    loop {
+        let mut stream = connection.accept_uni().await?;
+        let mut request = [0u8; 8];
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            stream.read_exact(&mut request),
+        )
+            .await;
+
+        if matches!(result, Ok(Ok(_))) && request == KEYFRAME_REQUEST_MAGIC {
+            if tx.send(()).await.is_err() {
+                return Ok(());
+            }
+        }
+    }
 }
 #[cfg(test)]
 mod tests {

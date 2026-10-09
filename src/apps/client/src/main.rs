@@ -12,6 +12,7 @@ use std::{
     },
     time::Instant,
 };
+use std::time::Duration;
 use transport::TransportClient;
 use winit::{
     application::ApplicationHandler,
@@ -56,75 +57,117 @@ impl Default for App {
     }
 }
 
-fn start_network(
-    tx: SyncSender<VideoPacket>,
-) {
+fn start_network(tx: SyncSender<VideoPacket>) {
     std::thread::spawn(move || {
-        let runtime =
-            match tokio::runtime::Runtime::new() {
-                Ok(runtime) => runtime,
-                Err(error) => {
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                println!("Tokio runtime error: {}", error);
+                return;
+            }
+        };
+
+        let result = runtime.block_on(async move {
+            let certificate = std::fs::read(CERTIFICATE_PATH)?;
+
+            let debug_drop_every = std::env::var(
+                "SHAPE_DEBUG_DROP_EVERY_NTH_FRAME",
+            )
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0);
+
+            let client = TransportClient::connect(
+                SERVER_ADDR.parse()?,
+                &certificate,
+            )
+                .await?;
+
+            println!("Connected to host: {}", SERVER_ADDR);
+
+            let mut assembler = FrameAssembler::new();
+            let mut last_sequence: Option<u64> = None;
+            let mut awaiting_keyframe = true;
+            let mut last_keyframe_request =
+                Instant::now() - Duration::from_millis(500);
+
+            loop {
+                let packet = client
+                    .recv_video_packet(&mut assembler)
+                    .await?;
+
+                if debug_drop_every.is_some_and(|n| {
+                    packet.sequence > 0 && packet.sequence % n == 0
+                }) {
                     println!(
-                        "Tokio runtime error: {}",
-                        error
+                        "DEBUG: intentionally dropped frame {}",
+                        packet.sequence
                     );
-                    return;
+                    continue;
                 }
-            };
 
-        let result =
-            runtime.block_on(async move {
-                let certificate =
-                    std::fs::read(
-                        CERTIFICATE_PATH
-                    )?;
+                if let Some(last) = last_sequence {
+                    if packet.sequence <= last {
+                        continue;
+                    }
 
-                let client =
-                    TransportClient::connect(
-                        SERVER_ADDR
-                            .parse()?,
-                        &certificate,
-                    )
-                        .await?;
+                    if packet.sequence > last.saturating_add(1) {
+                        println!(
+                            "Video frame gap: expected {}, received {}",
+                            last.saturating_add(1),
+                            packet.sequence
+                        );
 
-                println!(
-                    "Connected to host: {}",
-                    SERVER_ADDR
-                );
-
-                let mut assembler =
-                    FrameAssembler::new();
-
-                loop {
-                    let packet =
-                        client
-                            .recv_video_packet(
-                                &mut assembler,
-                            )
-                            .await?;
-
-                    if tx.send(packet).is_err() {
-                        break;
+                        awaiting_keyframe = true;
                     }
                 }
 
-                Ok::<
-                    (),
-                    Box<
-                        dyn std::error::Error
-                        + Send
-                        + Sync,
-                    >,
-                >(())
-            });
+                last_sequence = Some(packet.sequence);
 
-        if let Err(error) =
-            result
-        {
-            println!(
-                "Transport error: {}",
-                error
-            );
+                if awaiting_keyframe && !packet.keyframe {
+                    if last_keyframe_request.elapsed()
+                        >= Duration::from_millis(500)
+                    {
+                        last_keyframe_request = Instant::now();
+
+                        match client.request_keyframe().await {
+                            Ok(()) => {
+                                println!("Keyframe request sent");
+                            }
+                            Err(error) => {
+                                println!(
+                                    "Keyframe request failed: {}",
+                                    error
+                                );
+                            }
+                        }
+                    }
+
+                    continue;
+                }
+
+                if packet.keyframe && awaiting_keyframe {
+                    println!(
+                        "Video recovery at keyframe {}",
+                        packet.sequence
+                    );
+
+                    awaiting_keyframe = false;
+                }
+
+                if tx.send(packet).is_err() {
+                    break;
+                }
+            }
+
+            Ok::<
+                (),
+                Box<dyn std::error::Error + Send + Sync>,
+            >(())
+        });
+
+        if let Err(error) = result {
+            println!("Transport error: {}", error);
         }
     });
 }
@@ -219,6 +262,7 @@ impl ApplicationHandler for App {
                 }
             }
 
+
             WindowEvent::RedrawRequested => {
                 if let (
                     Some(receiver),
@@ -229,60 +273,48 @@ impl ApplicationHandler for App {
                     &mut self.decoder,
                     &mut self.renderer,
                 ) {
+                    let mut latest_frame: Option<(u32, u32, Vec<u8>)> = None;
+
                     loop {
-                        let packet =
-                            match receiver.try_recv() {
-                                Ok(packet) => packet,
-                                Err(
-                                    mpsc::TryRecvError::Empty
-                                ) => break,
-                                Err(
-                                    mpsc::TryRecvError::Disconnected
-                                ) => break,
-                            };
+                        let packet = match receiver.try_recv() {
+                            Ok(packet) => packet,
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => break,
+                        };
 
-                        let decoded_frames =
-                            match decoder.decode(
-                                &packet.payload,
-                                packet.timestamp,
-                                packet.duration,
-                            ) {
-                                Ok(frames) => frames,
-                                Err(error) => {
-                                    println!(
-                                        "Decoder error: {:?}",
-                                        error
-                                    );
-                                    continue;
-                                }
-                            };
+                        let decoded_frames = match decoder.decode(
+                            &packet.payload,
+                            packet.timestamp,
+                            packet.duration,
+                        ) {
+                            Ok(frames) => frames,
+                            Err(error) => {
+                                println!("Decoder error: {:?}", error);
+                                continue;
+                            }
+                        };
 
-                        for decoded
-                        in decoded_frames
-                        {
-                            let bgra =
-                                decoder
-                                    .nv12_to_bgra(
-                                        &decoded.data
-                                    );
-
-                            renderer.update_frame(
+                        for decoded in decoded_frames {
+                            latest_frame = Some((
                                 decoded.width,
                                 decoded.height,
-                                &bgra,
-                            );
+                                decoded.data,
+                            ));
 
-                            self.decoded_frame_count +=
-                                1;
+                            self.decoded_frame_count += 1;
                         }
+                    }
+
+                    if let Some((width, height, nv12)) = latest_frame {
+                        let bgra = decoder.nv12_to_bgra(&nv12);
+                        renderer.update_frame(width, height, &bgra);
                     }
                 }
 
-                if let Some(renderer) =
-                    &self.renderer
-                {
+                if let Some(renderer) = &self.renderer {
                     renderer.render();
                 }
+
             }
 
             _ => {}

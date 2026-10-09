@@ -3,8 +3,11 @@ use capture::Capture;
 use encoder::Encoder;
 use protocol::VideoPacket;
 use std::time::{Duration, Instant};
-use transport::{send_video_packet, TransportServer};
-
+use transport::{
+    listen_for_keyframe_requests,
+    send_video_packet,
+    TransportServer,
+};
 const SERVER_ADDR: &str = "0.0.0.0:5000";
 const CERTIFICATE_PATH: &str = "host.cert";
 
@@ -37,6 +40,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "Client connected: {}",
         connection.remote_address()
     );
+    let (keyframe_tx, mut keyframe_rx) =
+        tokio::sync::mpsc::channel::<()>(1);
+
+    let control_connection = connection.clone();
+
+    tokio::spawn(async move {
+        if let Err(error) = listen_for_keyframe_requests(
+            control_connection,
+            keyframe_tx,
+        )
+            .await
+        {
+            eprintln!("Control channel stopped: {error}");
+        }
+    });
+
+    let mut force_keyframe = false;
+
 
     let mut pending_input = 0u32;
     let mut pending_output = 0u32;
@@ -48,6 +69,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut discarded_frames = 0u64;
 
     loop {
+        while keyframe_rx.try_recv().is_ok() {
+            force_keyframe = true;
+        }
         let (need_input, have_output) = encoder.poll_events()?;
 
         pending_input = pending_input.saturating_add(need_input);
@@ -100,6 +124,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     &data,
                     frame.timestamp,
                 )?;
+
+                if force_keyframe {
+                    match encoder.force_next_keyframe() {
+                        Ok(()) => {
+                            println!("Keyframe request accepted by encoder");
+                        }
+                        Err(error) => {
+                            eprintln!("Encoder keyframe request failed: {error}");
+                        }
+                    }
+
+                    force_keyframe = false;
+                }
+
 
                 encoder.submit(0, &sample)?;
 

@@ -1,5 +1,4 @@
 use std::ffi::c_void;
-
 use windows::{
     core::{Interface, Result},
     Win32::{
@@ -26,10 +25,13 @@ use windows::{
             MFShutdown,
             MF_VERSION,
             MFSTARTUP_FULL,
+            ICodecAPI,
+            CODECAPI_AVEncVideoForceKeyFrame,
         },
         System::Com::CoTaskMemFree,
     },
 };
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::Media::MediaFoundation::{IMFMediaEventGenerator, IMFSample, METransformHaveOutput, METransformNeedInput, MFCreateMemoryBuffer, MFCreateSample, MFSampleExtension_CleanPoint, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MF_EVENT_FLAG_NO_WAIT, MF_EVENT_MFT_INPUT_STREAM_ID, MF_E_NO_EVENTS_AVAILABLE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE};
 
 #[derive(Debug)]
@@ -255,7 +257,17 @@ impl Encoder {
 
         Ok(())
     }
+    pub fn force_next_keyframe(&self) -> Result<()> {
+        unsafe {
+            let codec_api: ICodecAPI = self.transform.cast()?;
+            let value = VARIANT::from(1u32);
 
+            codec_api.SetValue(
+                &CODECAPI_AVEncVideoForceKeyFrame,
+                &value,
+            )
+        }
+    }
     pub fn is_ready(&self) -> bool {
         !self.transform.as_raw().is_null()
     }
